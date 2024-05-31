@@ -33,37 +33,26 @@ impl Compressor {
         let name = name.to_string();
         let channels = config.channels;
         let srate = samplerate as PrcFmt;
-        let mut monitor_channels = config.monitor_channels();
-        if monitor_channels.is_empty() {
-            for n in 0..channels {
-                monitor_channels.push(n);
-            }
-        }
-        let mut process_channels = config.process_channels();
-        if process_channels.is_empty() {
-            for n in 0..channels {
-                process_channels.push(n);
-            }
-        }
+        let monitor_channels = config.monitor_channels().or_else(|| (0..channels).collect());
+        let process_channels = config.process_channels().or_else(|| (0..channels).collect());
+
         let attack = (-1.0 / srate / config.attack).exp();
         let release = (-1.0 / srate / config.release).exp();
-        let clip_limit = config
-            .clip_limit
-            .map(|lim| (10.0 as PrcFmt).powf(lim / 20.0));
+        let clip_limit = config.clip_limit.map(|lim| (10.0 as PrcFmt).powf(lim / 20.0));
 
         let scratch = vec![0.0; chunksize];
-
-        debug!("Creating compressor '{}', channels: {}, monitor_channels: {:?}, process_channels: {:?}, attack: {}, release: {}, threshold: {}, factor: {}, makeup_gain: {}, soft_clip: {}, clip_limit: {:?}", 
-                name, channels, process_channels, monitor_channels, attack, release, config.threshold, config.factor, config.makeup_gain(), config.soft_clip(), clip_limit);
-        let limiter = if let Some(limit) = config.clip_limit {
+        let limiter = config.clip_limit.map(|limit| {
             let limitconf = config::LimiterParameters {
                 clip_limit: limit,
                 soft_clip: config.soft_clip,
             };
-            Some(Limiter::from_config("Limiter", limitconf))
-        } else {
-            None
-        };
+            Limiter::from_config("Limiter", limitconf)
+        });
+
+        debug!(
+            "Creating compressor '{}', channels: {}, monitor_channels: {:?}, process_channels: {:?}, attack: {}, release: {}, threshold: {}, factor: {}, makeup_gain: {}, soft_clip: {}, clip_limit: {:?}",
+            name, channels, process_channels, monitor_channels, attack, release, config.threshold, config.factor, config.makeup_gain(), config.soft_clip(), clip_limit
+        );
 
         Compressor {
             name,
@@ -84,46 +73,41 @@ impl Compressor {
 
     /// Sum all channels that are included in loudness monitoring, store result in self.scratch
     fn sum_monitor_channels(&mut self, input: &AudioChunk) {
-        let ch = self.monitor_channels[0];
-        self.scratch.copy_from_slice(&input.waveforms[ch]);
-        for ch in self.monitor_channels.iter().skip(1) {
-            for (acc, val) in self.scratch.iter_mut().zip(input.waveforms[*ch].iter()) {
-                *acc += *val;
-            }
+        let first_channel = self.monitor_channels[0];
+        self.scratch.copy_from_slice(&input.waveforms[first_channel]);
+        for &ch in &self.monitor_channels[1..] {
+            self.scratch.iter_mut().zip(&input.waveforms[ch]).for_each(|(acc, &val)| *acc += val);
         }
     }
 
     /// Estimate loudness, store result in self.scratch
     fn estimate_loudness(&mut self) {
-        for val in self.scratch.iter_mut() {
-            // convert to dB
+        for val in &mut self.scratch {
             *val = 20.0 * (val.abs() + 1.0e-9).log10();
-            if *val >= self.prev_loudness {
-                *val = self.attack * self.prev_loudness + (1.0 - self.attack) * *val;
+            *val = if *val >= self.prev_loudness {
+                self.attack * self.prev_loudness + (1.0 - self.attack) * *val
             } else {
-                *val = self.release * self.prev_loudness + (1.0 - self.release) * *val;
-            }
+                self.release * self.prev_loudness + (1.0 - self.release) * *val
+            };
             self.prev_loudness = *val;
         }
     }
 
     /// Calculate linear gain, store result in self.scratch
     fn calculate_linear_gain(&mut self) {
-        for val in self.scratch.iter_mut() {
-            if *val > self.threshold {
-                *val = -(*val - self.threshold) * (self.factor - 1.0) / self.factor;
+        for val in &mut self.scratch {
+            *val = if *val > self.threshold {
+                -(*val - self.threshold) * (self.factor - 1.0) / self.factor
             } else {
-                *val = 0.0;
-            }
+                0.0
+            };
             *val += self.makeup_gain;
             *val = (10.0 as PrcFmt).powf(*val / 20.0);
         }
     }
 
     fn apply_gain(&self, input: &mut [PrcFmt]) {
-        for (val, gain) in input.iter_mut().zip(self.scratch.iter()) {
-            *val *= gain;
-        }
+        input.iter_mut().zip(&self.scratch).for_each(|(val, &gain)| *val *= gain);
     }
 
     fn apply_limiter(&self, input: &mut [PrcFmt]) {
@@ -143,97 +127,70 @@ impl Processor for Compressor {
         self.sum_monitor_channels(input);
         self.estimate_loudness();
         self.calculate_linear_gain();
-        for ch in self.process_channels.iter() {
-            self.apply_gain(&mut input.waveforms[*ch]);
-            self.apply_limiter(&mut input.waveforms[*ch]);
+        for &ch in &self.process_channels {
+            self.apply_gain(&mut input.waveforms[ch]);
+            self.apply_limiter(&mut input.waveforms[ch]);
         }
         Ok(())
     }
 
     fn update_parameters(&mut self, config: config::Processor) {
-        // TODO remove when there is more than one type of Processor.
-        #[allow(irrefutable_let_patterns)]
-        if let config::Processor::Compressor {
-            parameters: config, ..
-        } = config
-        {
+        if let config::Processor::Compressor { parameters: config, .. } = config {
             let channels = config.channels;
             let srate = self.samplerate as PrcFmt;
-            let mut monitor_channels = config.monitor_channels();
-            if monitor_channels.is_empty() {
-                for n in 0..channels {
-                    monitor_channels.push(n);
-                }
-            }
-            let mut process_channels = config.process_channels();
-            if process_channels.is_empty() {
-                for n in 0..channels {
-                    process_channels.push(n);
-                }
-            }
-            let attack = (-1.0 / srate / config.attack).exp();
-            let release = (-1.0 / srate / config.release).exp();
-            let clip_limit = config
-                .clip_limit
-                .map(|lim| (10.0 as PrcFmt).powf(lim / 20.0));
 
-            let limiter = if let Some(limit) = config.clip_limit {
+            self.monitor_channels = config.monitor_channels().or_else(|| (0..channels).collect());
+            self.process_channels = config.process_channels().or_else(|| (0..channels).collect());
+
+            self.attack = (-1.0 / srate / config.attack).exp();
+            self.release = (-1.0 / srate / config.release).exp();
+            let clip_limit = config.clip_limit.map(|lim| (10.0 as PrcFmt).powf(lim / 20.0));
+
+            self.limiter = config.clip_limit.map(|limit| {
                 let limitconf = config::LimiterParameters {
                     clip_limit: limit,
                     soft_clip: config.soft_clip,
                 };
-                Some(Limiter::from_config("Limiter", limitconf))
-            } else {
-                None
-            };
+                Limiter::from_config("Limiter", limitconf)
+            });
 
-            self.monitor_channels = monitor_channels;
-            self.process_channels = process_channels;
-            self.attack = attack;
-            self.release = release;
             self.threshold = config.threshold;
             self.factor = config.factor;
             self.makeup_gain = config.makeup_gain();
-            self.limiter = limiter;
 
-            debug!("Updated compressor '{}', monitor_channels: {:?}, process_channels: {:?}, attack: {}, release: {}, threshold: {}, factor: {}, makeup_gain: {}, soft_clip: {}, clip_limit: {:?}", 
-                self.name, self.process_channels, self.monitor_channels, attack, release, config.threshold, config.factor, config.makeup_gain(), config.soft_clip(), clip_limit);
+            debug!(
+                "Updated compressor '{}', monitor_channels: {:?}, process_channels: {:?}, attack: {}, release: {}, threshold: {}, factor: {}, makeup_gain: {}, soft_clip: {}, clip_limit: {:?}",
+                self.name, self.monitor_channels, self.process_channels, self.attack, self.release, self.threshold, self.factor, self.makeup_gain, config.soft_clip(), clip_limit
+            );
         } else {
-            // This should never happen unless there is a bug somewhere else
             panic!("Invalid config change!");
         }
     }
 }
 
-/// Validate the compressor config, to give a helpful message intead of a panic.
+/// Validate the compressor config, to give a helpful message instead of a panic.
 pub fn validate_compressor(config: &config::CompressorParameters) -> Res<()> {
-    let channels = config.channels;
     if config.attack <= 0.0 {
-        let msg = "Attack value must be larger than zero.";
-        return Err(config::ConfigError::new(msg).into());
+        return Err(config::ConfigError::new("Attack value must be larger than zero.").into());
     }
     if config.release <= 0.0 {
-        let msg = "Release value must be larger than zero.";
-        return Err(config::ConfigError::new(msg).into());
+        return Err(config::ConfigError::new("Release value must be larger than zero.").into());
     }
-    for ch in config.monitor_channels().iter() {
-        if *ch >= channels {
-            let msg = format!(
+    let channels = config.channels;
+    for &ch in &config.monitor_channels() {
+        if ch >= channels {
+            return Err(config::ConfigError::new(&format!(
                 "Invalid monitor channel: {}, max is: {}.",
-                *ch,
-                channels - 1
-            );
-            return Err(config::ConfigError::new(&msg).into());
+                ch, channels - 1
+            )).into());
         }
     }
-    for ch in config.process_channels().iter() {
-        if *ch >= channels {
-            let msg = format!(
+    for &ch in &config.process_channels() {
+        if ch >= channels {
+            return Err(config::ConfigError::new(&format!(
                 "Invalid channel to process: {}, max is: {}.",
-                *ch,
-                channels - 1
-            );
-            return Err(config::ConfigError::new(&msg).into());
+                ch, channels - 1
+            )).into());
         }
     }
     Ok(())
